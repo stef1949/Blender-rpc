@@ -1,6 +1,5 @@
 import bpy
 import os
-import sys
 import time
 import threading
 from .pypresence import pypresence as rpc
@@ -10,8 +9,8 @@ bl_info = {
     "name": "Blender Rich Presence",
     "description": "Discord Rich Presence support for Blender",
     "author": "Protinon",
-    "version": (1, 3, 0),
-    "blender": (4, 0, 0),
+    "version": (2, 0, 0),
+    "blender": (5, 0, 0),
     "tracker_url": "https://github.com/Protinon/Blender-rpc",
     "category": "System",
 }
@@ -20,6 +19,8 @@ bl_info = {
 # Blender Bot ID
 rpcConn = None
 rpcConnThread = None
+lastConnectAttempt = 0.0
+reconnectCooldown = 10.0
 # Name of Blender icon that has been uploaded to the discord bot
 iconBlender = 'blender'
 # Get the temp directory of the system based on Blender's temp dir
@@ -31,6 +32,11 @@ renderContext = None
 # For logging errorss.
 # If users have many addons installed, good to know which one is generating problems!
 logPrefix = "[Blender-rpc]"
+
+def log(message):
+    addon_entry = bpy.context.preferences.addons.get(__name__)
+    if addon_entry is not None and addon_entry.preferences.enableLogging:
+        print(f"{logPrefix} {message}")
 
 
 class RenderInfo:
@@ -48,35 +54,36 @@ def connectToDiscord(currentTry = 0):
     try:
         rpcConn = rpc.Presence("674448359850901546")
         rpcConn.connect()
-        print(f"{logPrefix} Connected to Discord!")
+        log("Connected to Discord!")
         return
     except rpc.ConnectionTimeout:
         if currentTry >= 3:
-            print(f"{logPrefix} Connection aborted")
+            log("Connection aborted")
             return
-        print(f"{logPrefix} Connection failed ({currentTry+1}/3)")
+        log(f"Connection failed ({currentTry+1}/3)")
         connectToDiscord(currentTry=currentTry+1)
     except rpc.InvalidID:
-        print(f"{logPrefix} Discord bot ID invalid. Please report to developer on Github")
-        print(f"{logPrefix} https://github.com/Protinon/Blender-rpc/issues")
+        log("Discord bot ID invalid. Please report to developer on Github")
+        log("https://github.com/Protinon/Blender-rpc/issues")
     except rpc.DiscordNotFound:
-        print(f"{logPrefix} Discord was not found. Aborting.")
+        log("Discord was not found. Aborting.")
     except rpc.InvalidPipe:
-        print(f"{logPrefix} Invalid IPC pipe. Aborting.")
+        log("Invalid IPC pipe. Aborting.")
     except rpc.DiscordError as ex:
-        print(f"{logPrefix} Unknown Discord error: {ex}. Aborting.")
+        log(f"Unknown Discord error: {ex}. Aborting.")
     except Exception as ex:
-        print(f"{logPrefix} Unknown error: {ex}. Aborting.")
+        log(f"Unknown error: {ex}. Aborting.")
     
     rpcConn = None
 
 def register():
     global startTime
+    global rpcConnThread
 
+    bpy.utils.register_class(RpcTestOperator)
     bpy.utils.register_class(RpcPreferences)
     startTime = time.time()
-    rpcConnThread = threading.Thread()
-    rpcConnThread.run = connectToDiscord
+    rpcConnThread = threading.Thread(target=connectToDiscord, daemon=True)
     rpcConnThread.start()
     writePidFileAtomic()
     bpy.app.timers.register(updatePresenceTimer, first_interval=1.0, persistent=True)
@@ -95,15 +102,26 @@ def unregister():
     if rpcConn is not None:
         rpcConn.close()
     removePidFile()
-    bpy.app.timers.unregister(updatePresenceTimer)
-    bpy.app.handlers.save_post.remove(writePidHandler)
+    if bpy.app.timers.is_registered(updatePresenceTimer):
+        bpy.app.timers.unregister(updatePresenceTimer)
+    try:
+        bpy.app.handlers.save_post.remove(writePidHandler)
+    except ValueError:
+        pass
+    bpy.utils.unregister_class(RpcTestOperator)
     bpy.utils.unregister_class(RpcPreferences)
     # Rendering
-    bpy.app.handlers.render_init.remove(startRenderJobHandler)
-    bpy.app.handlers.render_complete.remove(endRenderJobHandler)
-    bpy.app.handlers.render_cancel.remove(endRenderJobHandler)
-    bpy.app.handlers.render_post.remove(postRenderHandler)
-    bpy.app.handlers.load_post.remove(fileLoadHandler)
+    for handler_list, handler in (
+        (bpy.app.handlers.render_init, startRenderJobHandler),
+        (bpy.app.handlers.render_complete, endRenderJobHandler),
+        (bpy.app.handlers.render_cancel, endRenderJobHandler),
+        (bpy.app.handlers.render_post, postRenderHandler),
+        (bpy.app.handlers.load_post, fileLoadHandler),
+    ):
+        try:
+            handler_list.remove(handler)
+        except ValueError:
+            pass
 
 def writePidFileAtomic():
     """Write the process pid to a file
@@ -158,6 +176,8 @@ def endRenderJobHandler(*args):
 def postRenderHandler(*args):
     """Run when Blender finishes rendering a frame"""
     global renderContext
+    if renderContext is None:
+        return
     renderContext.renderedFrames += 1
 
 @bpy.app.handlers.persistent
@@ -192,7 +212,9 @@ def updatePresence():
     """
     # Pre-Checks
     if rpcConn is None:
-        return
+        maybeReconnect()
+        if rpcConn is None:
+            return
     readPid = readPidFile()
     if readPid is None:
         writePidFileAtomic()
@@ -201,7 +223,10 @@ def updatePresence():
         return
     
     # Addon Preferences
-    prefs = bpy.context.preferences.addons[__name__].preferences
+    addon_entry = bpy.context.preferences.addons.get(__name__)
+    if addon_entry is None:
+        return
+    prefs = addon_entry.preferences
 
     # Details and State
     if renderContext:
@@ -236,14 +261,29 @@ def updatePresence():
     largeIcon = iconBlender
     largeIconText = getVersionStr()
 
-    rpcConn.update(
-        pid=os.getpid(),
-        start=fStartTime,
-        state=activityState,
-        details=activityDescription,
-        large_image=largeIcon,
-        large_text=largeIconText,
-    )
+    try:
+        rpcConn.update(
+            pid=os.getpid(),
+            start=fStartTime,
+            state=activityState,
+            details=activityDescription,
+            large_image=largeIcon,
+            large_text=largeIconText,
+        )
+    except rpc.DiscordError as ex:
+        log(f"Discord update failed: {ex}.")
+        rpcConn.clear()
+    except Exception as ex:
+        log(f"Unknown update error: {ex}.")
+        rpcConn.clear()
+
+def maybeReconnect():
+    global lastConnectAttempt
+    now = time.time()
+    if now - lastConnectAttempt < reconnectCooldown:
+        return
+    lastConnectAttempt = now
+    connectToDiscord()
 
 def getFileName():
     """Name of this .blend file
@@ -292,6 +332,12 @@ class RpcPreferences(bpy.types.AddonPreferences):
         default=True,
     )
 
+    enableLogging: bpy.props.BoolProperty(
+        name="Enable Logging",
+        default=False,
+        description="Print addon log messages to the system console",
+    )
+
     renderingDisplay: bpy.props.EnumProperty(
         name="Show While Rendering",
         items=(
@@ -304,3 +350,16 @@ class RpcPreferences(bpy.types.AddonPreferences):
         self.layout.prop(self, "displayTime")
         self.layout.prop(self, "displayTimeRendering")
         self.layout.prop(self, "renderingDisplay")
+        self.layout.prop(self, "enableLogging")
+        self.layout.operator(RpcTestOperator.bl_idname, icon="PLAY")
+
+
+class RpcTestOperator(bpy.types.Operator):
+    bl_idname = "wm.blender_rpc_test_update"
+    bl_label = "Test Discord Update"
+    bl_description = "Send a one-off rich presence update"
+
+    def execute(self, context):
+        updatePresence()
+        self.report({"INFO"}, "Blender RPC: Test update sent")
+        return {"FINISHED"}
